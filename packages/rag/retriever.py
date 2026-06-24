@@ -13,6 +13,7 @@ from .indexer import load_index
 @dataclass
 class RetrievedChunk:
     chunk_index: int
+    document_id: str
     page_number: int
     text: str
     relevance_score: float  # 0–1 cosine similarity
@@ -30,7 +31,6 @@ def retrieve(
     merge results, and return the global top-k by relevance score.
     """
     q_vec = embed_query(query, api_key=api_key)
-    # Normalize query vector (matches the normalized index vectors)
     norm = np.linalg.norm(q_vec)
     if norm > 0:
         q_vec = q_vec / norm
@@ -50,18 +50,16 @@ def retrieve(
             if idx < 0:
                 continue
             chunk = manifest[idx]
-            # Inner product of normalized vectors is cosine similarity ∈ [-1, 1].
-            # Clamp to [0, 1] for display.
             relevance = float(np.clip(score, 0.0, 1.0))
             all_results.append(
                 RetrievedChunk(
                     chunk_index=chunk["chunk_index"],
+                    document_id=doc_id,
                     page_number=chunk["page_number"],
                     text=chunk["text"],
                     relevance_score=relevance,
                 )
             )
 
-    # Global top-k across all documents
     all_results.sort(key=lambda r: r.relevance_score, reverse=True)
     return all_results[:top_k]

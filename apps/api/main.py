@@ -25,6 +25,7 @@ from rag.ingestor import extract_text        # noqa: E402
 from rag.chunker import chunk_text          # noqa: E402
 from rag.embedder import embed_chunks       # noqa: E402
 from rag.indexer import build_index         # noqa: E402
+from agent.graph import run_agent           # noqa: E402
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -205,41 +206,65 @@ def delete_document(doc_id: str):
 
 @app.post("/api/v1/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    """Stub — returns mock data. Real agent wired in Session 3."""
-    conversation_id = req.conversation_id or str(uuid.uuid4())
+    if not req.document_ids:
+        raise HTTPException(status_code=400, detail="At least one document_id is required.")
+
     meta = _load_meta()
 
-    # Build mock citations from the first requested document we know about
-    citations: list[Citation] = []
-    for i, doc_id in enumerate(req.document_ids[:3], start=1):
-        if doc_id in meta:
-            doc = meta[doc_id]
-            citations.append(
-                Citation(
-                    index=i,
-                    document_id=doc_id,
-                    filename=doc["filename"],
-                    page=1,
-                    excerpt=f"(Mock excerpt {i} from {doc['filename']})",
-                    relevance_score=round(0.95 - i * 0.1, 2),
-                )
-            )
+    # Validate all requested doc IDs exist
+    missing = [d for d in req.document_ids if d not in meta]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Documents not found: {missing}")
+
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not anthropic_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured.")
+
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if not openai_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured.")
+
+    try:
+        final_state = run_agent(
+            query=req.query,
+            document_ids=req.document_ids,
+            document_meta=meta,
+            conversation_history=None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
+
+    # Serialise agent dataclasses → Pydantic models
+    citations = [
+        Citation(
+            index=c.index,
+            document_id=c.document_id,
+            filename=c.filename,
+            page=c.page,
+            excerpt=c.excerpt,
+            relevance_score=c.relevance_score,
+        )
+        for c in final_state.get("citations", [])
+    ]
 
     trace = [
-        AgentTraceStep(name="PLAN",     status="complete", description="Decomposing query into sub-questions", duration_ms=21),
-        AgentTraceStep(name="RETRIEVE", status="complete", description=f"Fetching top-5 chunks across {len(req.document_ids)} document(s)", duration_ms=138),
-        AgentTraceStep(name="REASON",   status="complete", description="Synthesising answer from retrieved context", duration_ms=84),
-        AgentTraceStep(name="TOOL",     status="pending",  description="No tool calls required", duration_ms=None),
-        AgentTraceStep(name="VERIFY",   status="complete", description="Hallucination risk: LOW", duration_ms=31),
+        AgentTraceStep(
+            name=s.name,
+            status=s.status,
+            description=s.description,
+            duration_ms=s.duration_ms,
+            payload=s.payload,
+        )
+        for s in final_state.get("trace", [])
     ]
 
     return ChatResponse(
-        answer=f'(Mock) You asked: "{req.query}". Real agent coming in Session 3.',
+        answer=final_state.get("answer", "No answer generated."),
         citations=citations,
-        confidence=0.82,
-        hallucination_risk="low",
+        confidence=float(final_state.get("retrieval_confidence", 0.0)),
+        hallucination_risk=final_state.get("hallucination_risk", "medium"),
         trace=trace,
-        conversation_id=conversation_id,
+        conversation_id=req.conversation_id or str(uuid.uuid4()),
     )
 
 
