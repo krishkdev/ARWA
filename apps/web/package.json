@@ -9,11 +9,12 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@radix-ui/react-slot": "^1.0.2",
+    "lucide-react": "^0.378.0",
     "next": "14.2.3",
     "react": "^18",
     "react-dom": "^18",
-    "lucide-react": "^0.378.0",
-    "@radix-ui/react-slot": "^1.0.2"
+    "react-markdown": "^10.1.0"
   },
   "devDependencies": {
     "@types/node": "^20",

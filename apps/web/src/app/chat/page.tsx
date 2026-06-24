@@ -98,19 +98,25 @@ function ChatPageInner() {
       setSendError(null)
       setLiveTrace([])
 
-      const msgId = `msg-${Date.now()}`
+      const ts = Date.now()
+      const msgId = `msg-${ts}`
 
-      // Add an empty streaming-in-progress message
+      // Show user bubble immediately, then add the empty assistant streaming slot
       setMessages((prev) => [
         ...prev,
         {
+          id: `user-${ts}`,
+          role: 'user' as const,
+          answer: text,
+        },
+        {
           id: msgId,
+          role: 'assistant' as const,
           answer: '',
           isStreaming: true,
           citations: [],
           confidence: 0,
           hallucination_risk: 'low' as const,
-          role: 'assistant' as const,
         },
       ])
 
@@ -451,7 +457,7 @@ function ChatPageInner() {
           >
             Citations
           </span>
-          {lastMsg && !lastMsg.isStreaming && lastMsg.citations.length > 0 && (
+          {lastMsg && !lastMsg.isStreaming && (lastMsg.citations ?? []).length > 0 && (
             <span
               style={{
                 display: 'inline-flex',
@@ -468,7 +474,7 @@ function ChatPageInner() {
                 fontWeight: 600,
               }}
             >
-              {lastMsg.citations.length}
+              {(lastMsg.citations ?? []).length}
             </span>
           )}
         </div>
@@ -487,12 +493,12 @@ function ChatPageInner() {
             <p style={{ fontSize: 13, color: 'var(--color-text-tertiary)', padding: '4px 0' }}>
               {sending ? 'Retrieving sources…' : 'Citations will appear here after your first question.'}
             </p>
-          ) : lastMsg.citations.length === 0 ? (
+          ) : (lastMsg.citations ?? []).length === 0 ? (
             <p style={{ fontSize: 13, color: 'var(--color-text-tertiary)', padding: '4px 0' }}>
               No citations found for this response.
             </p>
           ) : (
-            lastMsg.citations.map((c) => <CitationCard key={c.index} citation={c} />)
+            (lastMsg.citations ?? []).map((c) => <CitationCard key={c.index} citation={c} />)
           )}
         </div>
       </aside>
