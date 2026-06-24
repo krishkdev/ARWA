@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-page:          #F7F5F0;
+  --color-surface:       #FFFFFF;
+  --color-surface-sub:   #F0EDE8;
+  --color-border:        #E2DDD6;
+  --color-border-hover:  #C8C3BB;
+  --color-text-primary:  #1A1814;
+  --color-text-secondary:#6B6560;
+  --color-text-tertiary: #9E9992;
+  --color-accent:        #4F6EF7;
+  --color-accent-bg:     #EEF1FE;
+  --color-teal:          #1A8A6B;
+  --color-teal-bg:       #E8F5F1;
+  --color-pdf-red:       #E03B2F;
+  --color-success:       #1A7A4A;
+  --color-warning:       #C47A1A;
+  --color-warning-bg:    #FEF3E2;
+  --color-danger:        #C0392B;
+  --col-sources:         256px;
+  --col-citations:       300px;
+}
+
+[data-theme="dark"] {
+  --color-page:          #13110E;
+  --color-surface:       #1C1914;
+  --color-surface-sub:   #221F1A;
+  --color-border:        #2E2A24;
+  --color-border-hover:  #3E3A34;
+  --color-text-primary:  #F2EDE6;
+  --color-text-secondary:#8A8278;
+  --color-text-tertiary: #5A5650;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  background-color: var(--color-page);
+  color: var(--color-text-primary);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Thin scrollbars — visible on hover only */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 2px;
+}
+*:hover::-webkit-scrollbar-thumb {
+  background: #C8C3BB;
+}
