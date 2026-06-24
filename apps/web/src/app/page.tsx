@@ -3,6 +3,7 @@
 import { useState, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import PdfIcon from '@/components/PdfIcon'
+import { uploadDocument } from '@/lib/api'
 
 type UploadState = 'idle' | 'dragging' | 'selected' | 'uploading'
 
@@ -54,13 +55,17 @@ export default function LandingPage() {
     if (file) acceptFile(file)
   }
 
-  function handleUpload() {
+  async function handleUpload() {
     if (!selectedFile) return
     setUploadState('uploading')
-    // No API yet — simulate a brief delay then redirect with a stub id
-    setTimeout(() => {
-      router.push('/chat?doc=stub-id')
-    }, 1200)
+    setError(null)
+    try {
+      const result = await uploadDocument(selectedFile)
+      router.push(`/chat?doc=${result.document_id}`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed. Please try again.')
+      setUploadState('selected')
+    }
   }
 
   const isDragging = uploadState === 'dragging'

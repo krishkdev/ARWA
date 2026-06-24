@@ -4,9 +4,10 @@ import PdfIcon from './PdfIcon'
 import StatusChip from './StatusChip'
 
 export interface DocumentMeta {
-  id: string
+  document_id: string
   filename: string
   page_count: number
+  chunk_count?: number
   uploaded_at: string
   status: 'indexed' | 'processing' | 'failed'
 }
@@ -33,7 +34,7 @@ export default function DocumentRow({
   return (
     <div
       role="row"
-      onClick={() => onClick?.(doc.id)}
+      onClick={() => onClick?.(doc.document_id)}
       style={{
         display: 'flex',
         alignItems: 'center',
@@ -74,7 +75,7 @@ export default function DocumentRow({
           checked={selected ?? false}
           onChange={(e) => {
             e.stopPropagation()
-            onSelect?.(doc.id)
+            onSelect?.(doc.document_id)
           }}
           onClick={(e) => e.stopPropagation()}
           style={{ width: 14, height: 14, cursor: 'pointer', accentColor: '#4F6EF7' }}

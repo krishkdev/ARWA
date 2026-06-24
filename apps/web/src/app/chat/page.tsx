@@ -1,6 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { Suspense } from 'react'
+import { useState, useEffect, useCallback } from 'react'
+import { useSearchParams } from 'next/navigation'
 import { Plus, Activity } from 'lucide-react'
 
 import PdfIcon from '@/components/PdfIcon'
@@ -11,79 +13,24 @@ import ChatInput from '@/components/ChatInput'
 import SuggestedQuestion from '@/components/SuggestedQuestion'
 import AgentTraceStep from '@/components/AgentTraceStep'
 
-import type { DocumentMeta } from '@/components/DocumentRow'
+import { listDocuments, sendChat } from '@/lib/api'
+import type { DocumentMeta as ApiDocMeta } from '@/lib/api'
+import type { DocumentMeta as RowDocMeta } from '@/components/DocumentRow'
 import type { Message } from '@/components/ChatMessage'
 import type { Citation } from '@/components/CitationCard'
 import type { TraceStep } from '@/components/AgentTraceStep'
 
-// ── Placeholder data ────────────────────────────────────────────────────────
-
-const PLACEHOLDER_DOCS: DocumentMeta[] = [
-  {
-    id: 'doc-1',
-    filename: 'climate-report-2024.pdf',
-    page_count: 48,
-    uploaded_at: '2026-06-20T10:00:00Z',
-    status: 'indexed',
-  },
-  {
-    id: 'doc-2',
-    filename: 'methodology-appendix.pdf',
-    page_count: 12,
-    uploaded_at: '2026-06-22T14:30:00Z',
-    status: 'processing',
-  },
-]
-
-const PLACEHOLDER_CITATIONS: Citation[] = [
-  {
-    index: 1,
-    document_id: 'doc-1',
-    filename: 'climate-report-2024.pdf',
-    page: 14,
-    excerpt:
-      'Global average temperatures have risen by 1.2°C above pre-industrial levels, accelerating the frequency of extreme weather events across multiple regions.',
-    relevance_score: 0.92,
-  },
-  {
-    index: 2,
-    document_id: 'doc-1',
-    filename: 'climate-report-2024.pdf',
-    page: 27,
-    excerpt:
-      'Sea levels are projected to rise between 0.3 and 1.0 metres by 2100 under current emission trajectories, posing risks to coastal populations.',
-    relevance_score: 0.78,
-  },
-  {
-    index: 3,
-    document_id: 'doc-1',
-    filename: 'climate-report-2024.pdf',
-    page: 33,
-    excerpt:
-      'Arctic ice coverage declined by 13% per decade since 1979, with nine of the ten lowest extents recorded in the last decade.',
-    relevance_score: 0.65,
-  },
-]
-
-const PLACEHOLDER_MESSAGES: Message[] = [
-  {
-    id: 'msg-1',
-    answer:
-      'The report identifies three primary drivers of accelerating climate change: industrial emissions, deforestation, and methane from agriculture. **Global temperatures** have risen 1.2°C above pre-industrial levels, with the last decade recording the highest average temperatures since records began. The findings underscore an urgent need for systemic policy intervention across all major economies.',
-    citations: PLACEHOLDER_CITATIONS,
-    confidence: 0.87,
-    hallucination_risk: 'low',
-    role: 'assistant',
-  },
-]
-
-const PLACEHOLDER_TRACE: TraceStep[] = [
-  { name: 'PLAN',     status: 'complete', description: 'Decomposing into 2 sub-questions', duration_ms: 23, payload: { sub_questions: ['What are the primary drivers?', 'What are the key findings?'] } },
-  { name: 'RETRIEVE', status: 'complete', description: 'Fetching top-5 chunks · confidence 0.87', duration_ms: 142, payload: { chunks: 5, avg_score: 0.87 } },
-  { name: 'REASON',   status: 'complete', description: 'Cross-referencing chunk 3 with chunk 1', duration_ms: 89, payload: null as unknown as object },
-  { name: 'TOOL',     status: 'pending',  description: 'No tool calls required', duration_ms: null },
-  { name: 'VERIFY',   status: 'complete', description: 'Hallucination risk: LOW', duration_ms: 34, payload: { risk: 'low', score: 0.04 } },
-]
+// API DocumentMeta → DocumentRow DocumentMeta (same shape now, just re-typed)
+function toRowDoc(d: ApiDocMeta): RowDocMeta {
+  return {
+    document_id: d.document_id,
+    filename: d.filename,
+    page_count: d.page_count,
+    chunk_count: d.chunk_count,
+    uploaded_at: d.uploaded_at,
+    status: d.status,
+  }
+}
 
 const SUGGESTED_QUESTIONS = [
   'Summarize this document',
@@ -91,15 +38,55 @@ const SUGGESTED_QUESTIONS = [
   'What methodology was used?',
 ]
 
-// ── Component ───────────────────────────────────────────────────────────────
+// ── Placeholder trace (shown until Session 3 wires the real agent) ──────────
+const STUB_TRACE: TraceStep[] = [
+  { name: 'PLAN',     status: 'complete', description: 'Decomposing query into sub-questions',                          duration_ms: 21 },
+  { name: 'RETRIEVE', status: 'complete', description: 'Fetching top-5 chunks across selected documents',               duration_ms: 138 },
+  { name: 'REASON',   status: 'complete', description: 'Synthesising answer from retrieved context',                    duration_ms: 84 },
+  { name: 'TOOL',     status: 'pending',  description: 'No tool calls required',                                        duration_ms: null },
+  { name: 'VERIFY',   status: 'complete', description: 'Hallucination risk: LOW',                                       duration_ms: 31 },
+]
 
 export default function ChatPage() {
-  const [activeDocId, setActiveDocId] = useState('doc-1')
-  const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(new Set(['doc-1']))
-  const [showTrace, setShowTrace] = useState(false)
-  const [messages, setMessages] = useState<Message[]>(PLACEHOLDER_MESSAGES)
+  return (
+    <Suspense fallback={null}>
+      <ChatPageInner />
+    </Suspense>
+  )
+}
 
-  const activeDoc = PLACEHOLDER_DOCS.find((d) => d.id === activeDocId)
+function ChatPageInner() {
+  const searchParams = useSearchParams()
+  const initialDocId = searchParams.get('doc')
+
+  const [docs, setDocs] = useState<ApiDocMeta[]>([])
+  const [docsError, setDocsError] = useState<string | null>(null)
+  const [activeDocId, setActiveDocId] = useState<string | null>(initialDocId)
+  const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(
+    initialDocId ? new Set([initialDocId]) : new Set()
+  )
+  const [showTrace, setShowTrace] = useState(false)
+  const [messages, setMessages] = useState<Message[]>([])
+  const [sending, setSending] = useState(false)
+  const [sendError, setSendError] = useState<string | null>(null)
+
+  // Load document list on mount
+  useEffect(() => {
+    listDocuments()
+      .then((list) => {
+        setDocs(list)
+        // If we have an initialDocId from URL that's not yet in the list,
+        // it may still be processing — keep the selection as-is.
+        if (initialDocId && list.some((d) => d.document_id === initialDocId)) {
+          setActiveDocId(initialDocId)
+          setSelectedDocIds(new Set([initialDocId]))
+        } else if (!initialDocId && list.length > 0) {
+          setActiveDocId(list[0].document_id)
+          setSelectedDocIds(new Set([list[0].document_id]))
+        }
+      })
+      .catch((err) => setDocsError(err instanceof Error ? err.message : 'Failed to load documents'))
+  }, [initialDocId])
 
   function toggleSelected(id: string) {
     setSelectedDocIds((prev) => {
@@ -110,18 +97,44 @@ export default function ChatPage() {
     })
   }
 
-  function handleSend(text: string) {
-    // Placeholder: no API yet
-    const stub: Message = {
-      id: `msg-${Date.now()}`,
-      answer: `(Placeholder response to: "${text}") — API integration coming in Session 2.`,
-      citations: PLACEHOLDER_CITATIONS.slice(0, 1),
-      confidence: 0.5,
-      hallucination_risk: 'medium',
-      role: 'assistant',
-    }
-    setMessages((prev) => [...prev, stub])
-  }
+  const handleSend = useCallback(
+    async (text: string) => {
+      if (sending) return
+      setSending(true)
+      setSendError(null)
+
+      // Optimistic: show the question immediately (future: add user message bubble)
+      try {
+        const res = await sendChat(text, Array.from(selectedDocIds))
+
+        const citations: Citation[] = res.citations.map((c) => ({
+          index: c.index,
+          document_id: c.document_id,
+          filename: c.filename,
+          page: c.page,
+          excerpt: c.excerpt,
+          relevance_score: c.relevance_score,
+        }))
+
+        const msg: Message = {
+          id: `msg-${Date.now()}`,
+          answer: res.answer,
+          citations,
+          confidence: res.confidence,
+          hallucination_risk: res.hallucination_risk,
+          role: 'assistant',
+        }
+        setMessages((prev) => [...prev, msg])
+      } catch (err) {
+        setSendError(err instanceof Error ? err.message : 'Failed to send message.')
+      } finally {
+        setSending(false)
+      }
+    },
+    [sending, selectedDocIds]
+  )
+
+  const activeDoc = docs.find((d) => d.document_id === activeDocId)
 
   return (
     <div
@@ -146,7 +159,6 @@ export default function ChatPage() {
           overflow: 'hidden',
         }}
       >
-        {/* Panel header */}
         <div
           style={{
             display: 'flex',
@@ -196,18 +208,25 @@ export default function ChatPage() {
           </button>
         </div>
 
-        {/* Document list */}
         <div style={{ flex: 1, overflowY: 'auto' }}>
-          {PLACEHOLDER_DOCS.map((doc) => (
-            <DocumentRow
-              key={doc.id}
-              document={doc}
-              active={doc.id === activeDocId}
-              selected={selectedDocIds.has(doc.id)}
-              onClick={setActiveDocId}
-              onSelect={toggleSelected}
-            />
-          ))}
+          {docsError ? (
+            <p style={{ padding: '12px', fontSize: 13, color: '#C0392B' }}>{docsError}</p>
+          ) : docs.length === 0 ? (
+            <p style={{ padding: '12px', fontSize: 13, color: 'var(--color-text-tertiary)' }}>
+              No documents yet. Upload one on the home page.
+            </p>
+          ) : (
+            docs.map((doc) => (
+              <DocumentRow
+                key={doc.document_id}
+                document={toRowDoc(doc)}
+                active={doc.document_id === activeDocId}
+                selected={selectedDocIds.has(doc.document_id)}
+                onClick={setActiveDocId}
+                onSelect={toggleSelected}
+              />
+            ))
+          )}
         </div>
       </aside>
 
@@ -233,7 +252,6 @@ export default function ChatPage() {
             flexShrink: 0,
           }}
         >
-          {/* Breadcrumb */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             {activeDoc && <PdfIcon size={16} />}
             <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 500 }}>
@@ -241,7 +259,6 @@ export default function ChatPage() {
             </span>
           </div>
 
-          {/* Agent trace toggle */}
           <button
             type="button"
             onClick={() => setShowTrace((v) => !v)}
@@ -268,9 +285,8 @@ export default function ChatPage() {
         {/* Messages / Trace area */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
           {showTrace ? (
-            /* Agent trace view */
             <div style={{ display: 'flex', flexDirection: 'column', gap: 20, maxWidth: 640 }}>
-              {PLACEHOLDER_TRACE.map((step) => (
+              {STUB_TRACE.map((step) => (
                 <AgentTraceStep key={step.name} step={step} />
               ))}
             </div>
@@ -291,29 +307,38 @@ export default function ChatPage() {
                   ARWA
                 </div>
                 <p style={{ color: 'var(--color-text-secondary)', fontSize: 15, margin: 0 }}>
-                  Your document is ready.
+                  {activeDoc ? 'Your document is ready.' : 'Select a document to get started.'}
                 </p>
-                <p style={{ color: 'var(--color-text-tertiary)', fontSize: 13, margin: '4px 0 0' }}>
-                  Ask a question to get started.
-                </p>
+                {activeDoc && (
+                  <p style={{ color: 'var(--color-text-tertiary)', fontSize: 13, margin: '4px 0 0' }}>
+                    Ask a question to get started.
+                  </p>
+                )}
               </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: 480 }}>
-                {SUGGESTED_QUESTIONS.map((q) => (
-                  <SuggestedQuestion key={q} text={q} onSelect={handleSend} />
-                ))}
-              </div>
+              {activeDoc && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: 480 }}>
+                  {SUGGESTED_QUESTIONS.map((q) => (
+                    <SuggestedQuestion key={q} text={q} onSelect={handleSend} />
+                  ))}
+                </div>
+              )}
             </div>
           ) : (
-            /* Message list */
             <div style={{ display: 'flex', flexDirection: 'column', gap: 32, maxWidth: 720 }}>
               {messages.map((msg) => (
                 <ChatMessage key={msg.id} message={msg} />
               ))}
+              {sending && (
+                <p style={{ color: 'var(--color-text-tertiary)', fontSize: 13 }}>Thinking…</p>
+              )}
+              {sendError && (
+                <p style={{ color: '#C0392B', fontSize: 13 }}>{sendError}</p>
+              )}
             </div>
           )}
         </div>
 
-        {/* Suggested questions strip (only when messages exist) */}
+        {/* Suggested questions strip (only when messages exist and not in trace view) */}
         {!showTrace && messages.length > 0 && (
           <div
             style={{
@@ -339,7 +364,11 @@ export default function ChatPage() {
             flexShrink: 0,
           }}
         >
-          <ChatInput onSend={handleSend} sourceCount={selectedDocIds.size} />
+          <ChatInput
+            onSend={handleSend}
+            sourceCount={selectedDocIds.size}
+            disabled={sending || selectedDocIds.size === 0}
+          />
         </div>
       </main>
 
@@ -355,7 +384,6 @@ export default function ChatPage() {
           overflow: 'hidden',
         }}
       >
-        {/* Panel header */}
         <div
           style={{
             display: 'flex',
@@ -376,33 +404,47 @@ export default function ChatPage() {
           >
             Citations
           </span>
-          <span
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              minWidth: 20,
-              height: 20,
-              paddingLeft: 6,
-              paddingRight: 6,
-              borderRadius: 10,
-              backgroundColor: '#E8F5F1',
-              color: '#1A8A6B',
-              fontSize: 11,
-              fontWeight: 600,
-            }}
-          >
-            {PLACEHOLDER_CITATIONS.length}
-          </span>
+          {messages.length > 0 && (
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                minWidth: 20,
+                height: 20,
+                paddingLeft: 6,
+                paddingRight: 6,
+                borderRadius: 10,
+                backgroundColor: '#E8F5F1',
+                color: '#1A8A6B',
+                fontSize: 11,
+                fontWeight: 600,
+              }}
+            >
+              {messages[messages.length - 1].citations.length}
+            </span>
+          )}
         </div>
 
-        {/* Citation cards */}
         <div
-          style={{ flex: 1, overflowY: 'auto', padding: '12px', display: 'flex', flexDirection: 'column', gap: 8 }}
+          style={{
+            flex: 1,
+            overflowY: 'auto',
+            padding: '12px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+          }}
         >
-          {PLACEHOLDER_CITATIONS.map((c) => (
-            <CitationCard key={c.index} citation={c} />
-          ))}
+          {messages.length === 0 ? (
+            <p style={{ fontSize: 13, color: 'var(--color-text-tertiary)', padding: '4px 0' }}>
+              Citations will appear here after your first question.
+            </p>
+          ) : (
+            messages[messages.length - 1].citations.map((c) => (
+              <CitationCard key={c.index} citation={c} />
+            ))
+          )}
         </div>
       </aside>
     </div>
