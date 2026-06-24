@@ -271,17 +271,19 @@ async def chat(req: ChatRequest):
         }
 
         try:
+            # Each node returns a PARTIAL dict — merge back into full state
+            def apply(s: ARWAState, update: dict) -> ARWAState:
+                return {**s, **update}  # type: ignore[return-value]
+
             # ── PLAN ────────────────────────────────────────────────────────
-            t0 = time.monotonic()
-            state = await asyncio.to_thread(run_planner, state)
+            state = apply(state, await asyncio.to_thread(run_planner, state))
             plan_step = state["trace"][-1] if state["trace"] else None
             if plan_step:
                 yield _sse({"type": "trace", "step": _trace_dc_to_dict(plan_step)})
 
             # ── RETRIEVE (with one retry if low confidence) ─────────────────
             for _attempt in range(2):
-                t0 = time.monotonic()
-                state = await asyncio.to_thread(run_retriever, state)
+                state = apply(state, await asyncio.to_thread(run_retriever, state))
                 ret_step = state["trace"][-1] if state["trace"] else None
                 if ret_step:
                     yield _sse({"type": "trace", "step": _trace_dc_to_dict(ret_step)})
@@ -292,7 +294,7 @@ async def chat(req: ChatRequest):
             chunks = state.get("retrieved_chunks", [])
             context_parts: list[str] = []
             for i, ch in enumerate(chunks[:8]):
-                page = getattr(ch, "page_number", "?")
+                page = getattr(ch, "page", "?")
                 fname = meta.get(getattr(ch, "document_id", ""), {}).get("filename", "document")
                 context_parts.append(f"[{i+1}] {fname} p.{page}:\n{ch.text}")
             context_block = "\n\n".join(context_parts) or "No relevant context found."
@@ -329,18 +331,20 @@ async def chat(req: ChatRequest):
                 duration_ms=reason_ms,
                 payload=None,
             )
-            state["answer"] = full_answer
-            state["trace"].append(reason_step)
+            state = apply(state, {
+                "answer": full_answer,
+                "trace": list(state["trace"]) + [reason_step],
+            })
             yield _sse({"type": "trace", "step": _trace_dc_to_dict(reason_step)})
 
             # ── TOOL (stub — no tools fired in MVP) ─────────────────────────
-            state = await asyncio.to_thread(run_tool_executor, state)
+            state = apply(state, await asyncio.to_thread(run_tool_executor, state))
             tool_step = state["trace"][-1] if state["trace"] else None
             if tool_step:
                 yield _sse({"type": "trace", "step": _trace_dc_to_dict(tool_step)})
 
             # ── VERIFY ──────────────────────────────────────────────────────
-            state = await asyncio.to_thread(run_verifier, state)
+            state = apply(state, await asyncio.to_thread(run_verifier, state))
             verify_step = state["trace"][-1] if state["trace"] else None
             if verify_step:
                 yield _sse({"type": "trace", "step": _trace_dc_to_dict(verify_step)})
