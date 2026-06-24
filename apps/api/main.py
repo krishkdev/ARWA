@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 load_dotenv()
@@ -25,7 +28,14 @@ from rag.ingestor import extract_text        # noqa: E402
 from rag.chunker import chunk_text          # noqa: E402
 from rag.embedder import embed_chunks       # noqa: E402
 from rag.indexer import build_index         # noqa: E402
-from agent.graph import run_agent           # noqa: E402
+from agent.nodes import (                   # noqa: E402
+    run_planner,
+    run_retriever,
+    run_tool_executor,
+    run_verifier,
+)
+from agent.state import ARWAState           # noqa: E402
+from agent.state import AgentTraceStep as TraceStepDC  # noqa: E402
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -204,14 +214,26 @@ def delete_document(doc_id: str):
     return {"deleted": doc_id}
 
 
-@app.post("/api/v1/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+
+def _trace_dc_to_dict(s: TraceStepDC) -> dict:
+    return {
+        "name": s.name,
+        "status": s.status,
+        "description": s.description,
+        "duration_ms": s.duration_ms,
+        "payload": s.payload,
+    }
+
+
+@app.post("/api/v1/chat")
+async def chat(req: ChatRequest):
     if not req.document_ids:
         raise HTTPException(status_code=400, detail="At least one document_id is required.")
 
     meta = _load_meta()
-
-    # Validate all requested doc IDs exist
     missing = [d for d in req.document_ids if d not in meta]
     if missing:
         raise HTTPException(status_code=404, detail=f"Documents not found: {missing}")
@@ -224,47 +246,142 @@ def chat(req: ChatRequest):
     if not openai_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured.")
 
-    try:
-        final_state = run_agent(
-            query=req.query,
-            document_ids=req.document_ids,
-            document_meta=meta,
-            conversation_history=None,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
+    async def generate() -> AsyncGenerator[str, None]:
+        import time
 
-    # Serialise agent dataclasses → Pydantic models
-    citations = [
-        Citation(
-            index=c.index,
-            document_id=c.document_id,
-            filename=c.filename,
-            page=c.page,
-            excerpt=c.excerpt,
-            relevance_score=c.relevance_score,
-        )
-        for c in final_state.get("citations", [])
-    ]
+        state: ARWAState = {
+            "query": req.query,
+            "document_ids": req.document_ids,
+            "document_meta": meta,
+            "conversation_history": [],
+            "plan": "",
+            "sub_questions": [],
+            "retrieved_chunks": [],
+            "retrieval_confidence": 0.0,
+            "retrieval_attempt": 0,
+            "reasoning_steps": [],
+            "answer": "",
+            "tool_calls": [],
+            "tool_iterations": 0,
+            "citations": [],
+            "hallucination_risk": "medium",
+            "trace": [],
+            "status": "running",
+            "error": None,
+        }
 
-    trace = [
-        AgentTraceStep(
-            name=s.name,
-            status=s.status,
-            description=s.description,
-            duration_ms=s.duration_ms,
-            payload=s.payload,
-        )
-        for s in final_state.get("trace", [])
-    ]
+        try:
+            # ── PLAN ────────────────────────────────────────────────────────
+            t0 = time.monotonic()
+            state = await asyncio.to_thread(run_planner, state)
+            plan_step = state["trace"][-1] if state["trace"] else None
+            if plan_step:
+                yield _sse({"type": "trace", "step": _trace_dc_to_dict(plan_step)})
 
-    return ChatResponse(
-        answer=final_state.get("answer", "No answer generated."),
-        citations=citations,
-        confidence=float(final_state.get("retrieval_confidence", 0.0)),
-        hallucination_risk=final_state.get("hallucination_risk", "medium"),
-        trace=trace,
-        conversation_id=req.conversation_id or str(uuid.uuid4()),
+            # ── RETRIEVE (with one retry if low confidence) ─────────────────
+            for _attempt in range(2):
+                t0 = time.monotonic()
+                state = await asyncio.to_thread(run_retriever, state)
+                ret_step = state["trace"][-1] if state["trace"] else None
+                if ret_step:
+                    yield _sse({"type": "trace", "step": _trace_dc_to_dict(ret_step)})
+                if state.get("retrieval_confidence", 0.0) >= 0.4:
+                    break
+
+            # ── REASON (streaming via AsyncAnthropic) ───────────────────────
+            chunks = state.get("retrieved_chunks", [])
+            context_parts: list[str] = []
+            for i, ch in enumerate(chunks[:8]):
+                page = getattr(ch, "page_number", "?")
+                fname = meta.get(getattr(ch, "document_id", ""), {}).get("filename", "document")
+                context_parts.append(f"[{i+1}] {fname} p.{page}:\n{ch.text}")
+            context_block = "\n\n".join(context_parts) or "No relevant context found."
+
+            system_prompt = (
+                "You are ARWA, a grounded research assistant. "
+                "Answer the user's question using only the provided context. "
+                "Be concise and accurate. "
+                "If the context does not contain the answer, say so honestly."
+            )
+            user_msg = (
+                f"Context:\n{context_block}\n\n"
+                f"Question: {req.query}"
+            )
+
+            t_reason = time.monotonic()
+            full_answer = ""
+            async_client = AsyncAnthropic(api_key=anthropic_key)
+            async with async_client.messages.stream(
+                model="claude-sonnet-4-6",
+                max_tokens=2048,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_msg}],
+            ) as stream:
+                async for delta in stream.text_stream:
+                    full_answer += delta
+                    yield _sse({"type": "text", "delta": delta})
+
+            reason_ms = int((time.monotonic() - t_reason) * 1000)
+            reason_step: TraceStepDC = TraceStepDC(
+                name="REASON",
+                status="complete",
+                description=f"Generated answer · {len(full_answer)} chars",
+                duration_ms=reason_ms,
+                payload=None,
+            )
+            state["answer"] = full_answer
+            state["trace"].append(reason_step)
+            yield _sse({"type": "trace", "step": _trace_dc_to_dict(reason_step)})
+
+            # ── TOOL (stub — no tools fired in MVP) ─────────────────────────
+            state = await asyncio.to_thread(run_tool_executor, state)
+            tool_step = state["trace"][-1] if state["trace"] else None
+            if tool_step:
+                yield _sse({"type": "trace", "step": _trace_dc_to_dict(tool_step)})
+
+            # ── VERIFY ──────────────────────────────────────────────────────
+            state = await asyncio.to_thread(run_verifier, state)
+            verify_step = state["trace"][-1] if state["trace"] else None
+            if verify_step:
+                yield _sse({"type": "trace", "step": _trace_dc_to_dict(verify_step)})
+
+            # ── DONE ────────────────────────────────────────────────────────
+            citations_raw = state.get("citations", [])
+            citations_out = [
+                {
+                    "index": c.index,
+                    "document_id": c.document_id,
+                    "filename": c.filename,
+                    "page": c.page,
+                    "excerpt": c.excerpt,
+                    "relevance_score": c.relevance_score,
+                }
+                for c in citations_raw
+            ]
+            trace_out = [_trace_dc_to_dict(s) for s in state.get("trace", [])]
+
+            yield _sse({
+                "type": "done",
+                "answer": state.get("answer", ""),
+                "citations": citations_out,
+                "confidence": float(state.get("retrieval_confidence", 0.0)),
+                "hallucination_risk": state.get("hallucination_risk", "medium"),
+                "trace": trace_out,
+                "conversation_id": req.conversation_id or str(uuid.uuid4()),
+            })
+            yield "data: [DONE]\n\n"
+
+        except Exception as exc:
+            yield _sse({"type": "error", "message": str(exc)})
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

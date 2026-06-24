@@ -33,14 +33,6 @@ module.exports = {
         'warning-bg':'#FEF3E2',
         danger:     '#C0392B',
 
-        // Dark mode (chat screen)
-        dark: {
-          page:    '#13110E',
-          surface: '#1C1914',
-          border:  '#2E2A24',
-          text:    '#F2EDE6',
-          'text-sub':'#8A8278',
-        },
       },
 
       fontFamily: {

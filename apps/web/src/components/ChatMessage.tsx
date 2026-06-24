@@ -12,6 +12,7 @@ export interface Message {
   confidence: number
   hallucination_risk: 'low' | 'medium' | 'high'
   role: 'assistant'
+  isStreaming?: boolean
 }
 
 interface ChatMessageProps {
@@ -36,13 +37,14 @@ export default function ChatMessage({ message, onCitationClick }: ChatMessagePro
         }}
       >
         {message.answer}
+        {message.isStreaming && <span className="streaming-cursor" aria-hidden />}
       </p>
 
-      {/* Confidence bar — mandatory on every AI response */}
-      <ConfidenceBar score={message.confidence} />
+      {/* Confidence bar — mandatory on every AI response (only after streaming) */}
+      {!message.isStreaming && <ConfidenceBar score={message.confidence} />}
 
       {/* Citation chips row */}
-      {message.citations.length > 0 && (
+      {!message.isStreaming && message.citations.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
           {message.citations.map((c) => (
             <CitationChip
@@ -55,7 +57,7 @@ export default function ChatMessage({ message, onCitationClick }: ChatMessagePro
       )}
 
       {/* Action row */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+      {!message.isStreaming && <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         {([
           { Icon: ThumbsUp, label: 'Helpful', action: undefined as (() => void) | undefined },
           { Icon: ThumbsDown, label: 'Not helpful', action: undefined as (() => void) | undefined },
@@ -96,7 +98,7 @@ export default function ChatMessage({ message, onCitationClick }: ChatMessagePro
             Hallucination risk: {message.hallucination_risk}
           </span>
         )}
-      </div>
+      </div>}
     </div>
   )
 }

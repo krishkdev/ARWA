@@ -24,17 +24,6 @@
   --col-citations:       300px;
 }
 
-[data-theme="dark"] {
-  --color-page:          #13110E;
-  --color-surface:       #1C1914;
-  --color-surface-sub:   #221F1A;
-  --color-border:        #2E2A24;
-  --color-border-hover:  #3E3A34;
-  --color-text-primary:  #F2EDE6;
-  --color-text-secondary:#8A8278;
-  --color-text-tertiary: #5A5650;
-}
-
 * {
   box-sizing: border-box;
 }
@@ -63,4 +52,19 @@ body {
 }
 *:hover::-webkit-scrollbar-thumb {
   background: #C8C3BB;
+}
+
+/* Streaming cursor */
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+.streaming-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background-color: #1A1814;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: cursor-blink 0.9s step-end infinite;
 }

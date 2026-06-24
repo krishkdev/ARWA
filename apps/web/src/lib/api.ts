@@ -81,12 +81,20 @@ export async function deleteDocument(docId: string): Promise<void> {
   await request(`/documents/${docId}`, { method: "DELETE" });
 }
 
-export async function sendChat(
+// ── Streaming types ───────────────────────────────────────────────────────
+
+export type StreamEvent =
+  | { type: "trace"; step: AgentTraceStep }
+  | { type: "text"; delta: string }
+  | { type: "done"; answer: string; citations: Citation[]; confidence: number; hallucination_risk: "low" | "medium" | "high"; trace: AgentTraceStep[] }
+  | { type: "error"; message: string }
+
+export async function* streamChat(
   query: string,
   documentIds: string[],
   conversationId?: string
-): Promise<ChatResponse> {
-  return request<ChatResponse>("/chat", {
+): AsyncGenerator<StreamEvent> {
+  const res = await fetch(`${BASE}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -95,4 +103,42 @@ export async function sendChat(
       conversation_id: conversationId ?? null,
     }),
   });
+
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body.detail ?? detail;
+    } catch {}
+    yield { type: "error", message: detail };
+    return;
+  }
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Split on double-newline (SSE message boundary)
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+
+    for (const part of parts) {
+      const line = part.trim();
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") return;
+      try {
+        const event = JSON.parse(payload) as StreamEvent;
+        yield event;
+      } catch {
+        // malformed SSE line — skip
+      }
+    }
+  }
 }

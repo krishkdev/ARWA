@@ -1,7 +1,7 @@
 'use client'
 
 import { Suspense } from 'react'
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { Plus, Activity } from 'lucide-react'
 
@@ -13,14 +13,13 @@ import ChatInput from '@/components/ChatInput'
 import SuggestedQuestion from '@/components/SuggestedQuestion'
 import AgentTraceStep from '@/components/AgentTraceStep'
 
-import { listDocuments, sendChat } from '@/lib/api'
+import { listDocuments, streamChat } from '@/lib/api'
 import type { DocumentMeta as ApiDocMeta } from '@/lib/api'
 import type { DocumentMeta as RowDocMeta } from '@/components/DocumentRow'
 import type { Message } from '@/components/ChatMessage'
 import type { Citation } from '@/components/CitationCard'
 import type { TraceStep } from '@/components/AgentTraceStep'
 
-// API DocumentMeta → DocumentRow DocumentMeta (same shape now, just re-typed)
 function toRowDoc(d: ApiDocMeta): RowDocMeta {
   return {
     document_id: d.document_id,
@@ -36,15 +35,6 @@ const SUGGESTED_QUESTIONS = [
   'Summarize this document',
   'What are the key findings?',
   'What methodology was used?',
-]
-
-// ── Placeholder trace (shown until Session 3 wires the real agent) ──────────
-const STUB_TRACE: TraceStep[] = [
-  { name: 'PLAN',     status: 'complete', description: 'Decomposing query into sub-questions',                          duration_ms: 21 },
-  { name: 'RETRIEVE', status: 'complete', description: 'Fetching top-5 chunks across selected documents',               duration_ms: 138 },
-  { name: 'REASON',   status: 'complete', description: 'Synthesising answer from retrieved context',                    duration_ms: 84 },
-  { name: 'TOOL',     status: 'pending',  description: 'No tool calls required',                                        duration_ms: null },
-  { name: 'VERIFY',   status: 'complete', description: 'Hallucination risk: LOW',                                       duration_ms: 31 },
 ]
 
 export default function ChatPage() {
@@ -67,16 +57,15 @@ function ChatPageInner() {
   )
   const [showTrace, setShowTrace] = useState(false)
   const [messages, setMessages] = useState<Message[]>([])
+  const [liveTrace, setLiveTrace] = useState<TraceStep[]>([])
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState<string | null>(null)
+  const bottomRef = useRef<HTMLDivElement>(null)
 
-  // Load document list on mount
   useEffect(() => {
     listDocuments()
       .then((list) => {
         setDocs(list)
-        // If we have an initialDocId from URL that's not yet in the list,
-        // it may still be processing — keep the selection as-is.
         if (initialDocId && list.some((d) => d.document_id === initialDocId)) {
           setActiveDocId(initialDocId)
           setSelectedDocIds(new Set([initialDocId]))
@@ -87,6 +76,11 @@ function ChatPageInner() {
       })
       .catch((err) => setDocsError(err instanceof Error ? err.message : 'Failed to load documents'))
   }, [initialDocId])
+
+  // Scroll to bottom when messages grow
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
 
   function toggleSelected(id: string) {
     setSelectedDocIds((prev) => {
@@ -102,31 +96,66 @@ function ChatPageInner() {
       if (sending) return
       setSending(true)
       setSendError(null)
+      setLiveTrace([])
 
-      // Optimistic: show the question immediately (future: add user message bubble)
+      const msgId = `msg-${Date.now()}`
+
+      // Add an empty streaming-in-progress message
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: msgId,
+          answer: '',
+          isStreaming: true,
+          citations: [],
+          confidence: 0,
+          hallucination_risk: 'low' as const,
+          role: 'assistant' as const,
+        },
+      ])
+
       try {
-        const res = await sendChat(text, Array.from(selectedDocIds))
-
-        const citations: Citation[] = res.citations.map((c) => ({
-          index: c.index,
-          document_id: c.document_id,
-          filename: c.filename,
-          page: c.page,
-          excerpt: c.excerpt,
-          relevance_score: c.relevance_score,
-        }))
-
-        const msg: Message = {
-          id: `msg-${Date.now()}`,
-          answer: res.answer,
-          citations,
-          confidence: res.confidence,
-          hallucination_risk: res.hallucination_risk,
-          role: 'assistant',
+        for await (const event of streamChat(text, Array.from(selectedDocIds))) {
+          if (event.type === 'text') {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === msgId ? { ...m, answer: m.answer + event.delta } : m
+              )
+            )
+          } else if (event.type === 'trace') {
+            setLiveTrace((prev) => [...prev, event.step as TraceStep])
+          } else if (event.type === 'done') {
+            const citations: Citation[] = event.citations.map((c) => ({
+              index: c.index,
+              document_id: c.document_id,
+              filename: c.filename,
+              page: c.page,
+              excerpt: c.excerpt,
+              relevance_score: c.relevance_score,
+            }))
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === msgId
+                  ? {
+                      ...m,
+                      answer: event.answer,
+                      citations,
+                      confidence: event.confidence,
+                      hallucination_risk: event.hallucination_risk,
+                      isStreaming: false,
+                    }
+                  : m
+              )
+            )
+            setLiveTrace(event.trace as TraceStep[])
+          } else if (event.type === 'error') {
+            setSendError(event.message)
+            setMessages((prev) => prev.filter((m) => m.id !== msgId))
+          }
         }
-        setMessages((prev) => [...prev, msg])
       } catch (err) {
-        setSendError(err instanceof Error ? err.message : 'Failed to send message.')
+        setSendError(err instanceof Error ? err.message : 'Connection failed.')
+        setMessages((prev) => prev.filter((m) => m.id !== msgId))
       } finally {
         setSending(false)
       }
@@ -135,10 +164,10 @@ function ChatPageInner() {
   )
 
   const activeDoc = docs.find((d) => d.document_id === activeDocId)
+  const lastMsg = messages[messages.length - 1]
 
   return (
     <div
-      data-theme="dark"
       style={{
         display: 'flex',
         height: '100vh',
@@ -240,7 +269,7 @@ function ChatPageInner() {
           minWidth: 0,
         }}
       >
-        {/* Center top bar */}
+        {/* Top bar */}
         <div
           style={{
             display: 'flex',
@@ -285,13 +314,18 @@ function ChatPageInner() {
         {/* Messages / Trace area */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
           {showTrace ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 20, maxWidth: 640 }}>
-              {STUB_TRACE.map((step) => (
-                <AgentTraceStep key={step.name} step={step} />
-              ))}
-            </div>
+            liveTrace.length === 0 ? (
+              <p style={{ color: 'var(--color-text-tertiary)', fontSize: 13 }}>
+                Ask a question to see the agent trace.
+              </p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 20, maxWidth: 640 }}>
+                {liveTrace.map((step, i) => (
+                  <AgentTraceStep key={`${step.name}-${i}`} step={step} />
+                ))}
+              </div>
+            )
           ) : messages.length === 0 ? (
-            /* Empty / first-run state */
             <div
               style={{
                 display: 'flex',
@@ -303,7 +337,14 @@ function ChatPageInner() {
               }}
             >
               <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 24, fontWeight: 700, color: 'var(--color-text-primary)', marginBottom: 8 }}>
+                <div
+                  style={{
+                    fontSize: 24,
+                    fontWeight: 700,
+                    color: 'var(--color-text-primary)',
+                    marginBottom: 8,
+                  }}
+                >
                   ARWA
                 </div>
                 <p style={{ color: 'var(--color-text-secondary)', fontSize: 15, margin: 0 }}>
@@ -316,7 +357,15 @@ function ChatPageInner() {
                 )}
               </div>
               {activeDoc && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: 480 }}>
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 8,
+                    width: '100%',
+                    maxWidth: 480,
+                  }}
+                >
                   {SUGGESTED_QUESTIONS.map((q) => (
                     <SuggestedQuestion key={q} text={q} onSelect={handleSend} />
                   ))}
@@ -328,18 +377,16 @@ function ChatPageInner() {
               {messages.map((msg) => (
                 <ChatMessage key={msg.id} message={msg} />
               ))}
-              {sending && (
-                <p style={{ color: 'var(--color-text-tertiary)', fontSize: 13 }}>Thinking…</p>
-              )}
               {sendError && (
-                <p style={{ color: '#C0392B', fontSize: 13 }}>{sendError}</p>
+                <p style={{ color: '#C0392B', fontSize: 13, margin: 0 }}>{sendError}</p>
               )}
+              <div ref={bottomRef} />
             </div>
           )}
         </div>
 
-        {/* Suggested questions strip (only when messages exist and not in trace view) */}
-        {!showTrace && messages.length > 0 && (
+        {/* Suggested questions strip */}
+        {!showTrace && messages.length > 0 && !sending && (
           <div
             style={{
               padding: '0 24px 8px',
@@ -404,7 +451,7 @@ function ChatPageInner() {
           >
             Citations
           </span>
-          {messages.length > 0 && (
+          {lastMsg && !lastMsg.isStreaming && lastMsg.citations.length > 0 && (
             <span
               style={{
                 display: 'inline-flex',
@@ -421,7 +468,7 @@ function ChatPageInner() {
                 fontWeight: 600,
               }}
             >
-              {messages[messages.length - 1].citations.length}
+              {lastMsg.citations.length}
             </span>
           )}
         </div>
@@ -436,14 +483,16 @@ function ChatPageInner() {
             gap: 8,
           }}
         >
-          {messages.length === 0 ? (
+          {!lastMsg || lastMsg.isStreaming ? (
             <p style={{ fontSize: 13, color: 'var(--color-text-tertiary)', padding: '4px 0' }}>
-              Citations will appear here after your first question.
+              {sending ? 'Retrieving sources…' : 'Citations will appear here after your first question.'}
+            </p>
+          ) : lastMsg.citations.length === 0 ? (
+            <p style={{ fontSize: 13, color: 'var(--color-text-tertiary)', padding: '4px 0' }}>
+              No citations found for this response.
             </p>
           ) : (
-            messages[messages.length - 1].citations.map((c) => (
-              <CitationCard key={c.index} citation={c} />
-            ))
+            lastMsg.citations.map((c) => <CitationCard key={c.index} citation={c} />)
           )}
         </div>
       </aside>
