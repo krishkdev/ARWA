@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -36,37 +37,86 @@ from agent.nodes import (                   # noqa: E402
 )
 from agent.state import ARWAState           # noqa: E402
 from agent.state import AgentTraceStep as TraceStepDC  # noqa: E402
+import shared.database as db               # noqa: E402
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 STORE_DIR = os.environ.get(
     "FAISS_INDEX_PATH",
     str(_ROOT / "data" / "vector_store"),
 )
-METADATA_FILE = os.environ.get(
-    "METADATA_PATH",
-    str(_ROOT / "data" / "documents.json"),
-)
+OLD_METADATA_FILE = str(_ROOT / "data" / "documents.json")
+DB_PATH = str(_ROOT / "data" / "arwa.db")
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 
-# ── Metadata helpers ─────────────────────────────────────────────────────────
 
-def _load_meta() -> dict[str, Any]:
-    p = Path(METADATA_FILE)
-    if not p.exists():
-        return {}
-    return json.loads(p.read_text())
+# ── FAISS index recovery ──────────────────────────────────────────────────────
+
+async def _recover_indexes() -> None:
+    """
+    On startup, scan the vector store for .faiss files.
+    For each one not already in the DB, create a row using
+    the old documents.json as the metadata source.
+    """
+    store_path = Path(STORE_DIR)
+    if not store_path.exists():
+        return
+
+    # Load legacy metadata file if it exists
+    old_meta: dict[str, Any] = {}
+    old_meta_path = Path(OLD_METADATA_FILE)
+    if old_meta_path.exists():
+        try:
+            old_meta = json.loads(old_meta_path.read_text())
+        except Exception:
+            pass
+
+    for faiss_file in store_path.glob("*.faiss"):
+        doc_id = faiss_file.stem
+        if await db.document_exists(doc_id):
+            continue
+
+        if doc_id in old_meta:
+            m = old_meta[doc_id]
+            await db.upsert_document(
+                doc_id=doc_id,
+                filename=m.get("filename", f"{doc_id}.pdf"),
+                page_count=m.get("page_count", 0),
+                chunk_count=m.get("chunk_count", 0),
+                status=m.get("status", "indexed"),
+                uploaded_at=m.get("uploaded_at"),
+            )
+        else:
+            # Count chunks from manifest as best-effort metadata
+            manifest_file = store_path / f"{doc_id}.json"
+            chunk_count = 0
+            if manifest_file.exists():
+                try:
+                    chunk_count = len(json.loads(manifest_file.read_text()))
+                except Exception:
+                    pass
+            await db.upsert_document(
+                doc_id=doc_id,
+                filename=f"document-{doc_id[:8]}.pdf",
+                page_count=0,
+                chunk_count=chunk_count,
+                status="indexed",
+            )
 
 
-def _save_meta(data: dict[str, Any]) -> None:
-    p = Path(METADATA_FILE)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await db.init_db(DB_PATH)
+    await _recover_indexes()
+    yield
+    await db.close_db()
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
-app = FastAPI(title="ARWA API", version="0.1.0")
+app = FastAPI(title="ARWA API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -84,7 +134,7 @@ class DocumentMeta(BaseModel):
     page_count: int
     chunk_count: int
     uploaded_at: str
-    status: str  # "indexed" | "processing" | "failed"
+    status: str
 
 
 class UploadResponse(BaseModel):
@@ -118,13 +168,36 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
 
 
-class ChatResponse(BaseModel):
-    answer: str
-    citations: list[Citation]
-    confidence: float
-    hallucination_risk: str
-    trace: list[AgentTraceStep]
+class StoredMessage(BaseModel):
+    id: str
+    role: str
+    content: str
+    citations: list[dict] = []
+    confidence: float = 0.0
+    hallucination_risk: str = "low"
+    trace: list[dict] = []
+    created_at: str
+
+
+class ConversationResponse(BaseModel):
     conversation_id: str
+    messages: list[StoredMessage]
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+
+def _trace_dc_to_dict(s: TraceStepDC) -> dict:
+    return {
+        "name": s.name,
+        "status": s.status,
+        "description": s.description,
+        "duration_ms": s.duration_ms,
+        "payload": s.payload,
+    }
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -148,7 +221,6 @@ async def upload_document(file: UploadFile = File(...)):
     doc_id = str(uuid.uuid4())
     filename = file.filename
 
-    # ── Ingestion pipeline ───────────────────────────────────────────────────
     pages, page_count = extract_text(pdf_bytes)
     if not pages:
         raise HTTPException(status_code=422, detail="Could not extract text from PDF.")
@@ -162,17 +234,15 @@ async def upload_document(file: UploadFile = File(...)):
     embeddings = embed_chunks(chunks, api_key=openai_key)
     build_index(doc_id, chunks, embeddings, STORE_DIR)
 
-    # ── Persist metadata ─────────────────────────────────────────────────────
-    meta = _load_meta()
-    meta[doc_id] = {
-        "document_id": doc_id,
-        "filename": filename,
-        "page_count": page_count,
-        "chunk_count": len(chunks),
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
-        "status": "indexed",
-    }
-    _save_meta(meta)
+    uploaded_at = datetime.now(timezone.utc).isoformat()
+    await db.upsert_document(
+        doc_id=doc_id,
+        filename=filename,
+        page_count=page_count,
+        chunk_count=len(chunks),
+        status="indexed",
+        uploaded_at=uploaded_at,
+    )
 
     return UploadResponse(
         document_id=doc_id,
@@ -184,48 +254,32 @@ async def upload_document(file: UploadFile = File(...)):
 
 
 @app.get("/api/v1/documents", response_model=list[DocumentMeta])
-def list_documents():
-    meta = _load_meta()
-    return [DocumentMeta(**v) for v in meta.values()]
+async def list_documents():
+    rows = await db.get_all_documents()
+    return [DocumentMeta(**r) for r in rows]
 
 
 @app.get("/api/v1/documents/{doc_id}", response_model=DocumentMeta)
-def get_document(doc_id: str):
-    meta = _load_meta()
-    if doc_id not in meta:
+async def get_document(doc_id: str):
+    row = await db.get_document(doc_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Document not found.")
-    return DocumentMeta(**meta[doc_id])
+    return DocumentMeta(**row)
 
 
 @app.delete("/api/v1/documents/{doc_id}")
-def delete_document(doc_id: str):
-    meta = _load_meta()
-    if doc_id not in meta:
+async def delete_document(doc_id: str):
+    row = await db.get_document(doc_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Document not found.")
 
-    # Remove FAISS index files
     for ext in (".faiss", ".json"):
         p = Path(STORE_DIR) / f"{doc_id}{ext}"
         if p.exists():
             p.unlink()
 
-    del meta[doc_id]
-    _save_meta(meta)
+    await db.delete_document_row(doc_id)
     return {"deleted": doc_id}
-
-
-def _sse(event: dict) -> str:
-    return f"data: {json.dumps(event)}\n\n"
-
-
-def _trace_dc_to_dict(s: TraceStepDC) -> dict:
-    return {
-        "name": s.name,
-        "status": s.status,
-        "description": s.description,
-        "duration_ms": s.duration_ms,
-        "payload": s.payload,
-    }
 
 
 @app.post("/api/v1/chat")
@@ -233,7 +287,9 @@ async def chat(req: ChatRequest):
     if not req.document_ids:
         raise HTTPException(status_code=400, detail="At least one document_id is required.")
 
-    meta = _load_meta()
+    all_docs = await db.get_all_documents()
+    meta = {d["document_id"]: d for d in all_docs}
+
     missing = [d for d in req.document_ids if d not in meta]
     if missing:
         raise HTTPException(status_code=404, detail=f"Documents not found: {missing}")
@@ -245,6 +301,19 @@ async def chat(req: ChatRequest):
     openai_key = os.environ.get("OPENAI_API_KEY")
     if not openai_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured.")
+
+    # Conversation is keyed by the primary document (first in list) when none given
+    conversation_id = req.conversation_id or req.document_ids[0]
+
+    # Persist user message immediately so it survives if the stream is interrupted
+    user_msg_id = str(uuid.uuid4())
+    await db.save_message(
+        msg_id=user_msg_id,
+        conversation_id=conversation_id,
+        document_ids=req.document_ids,
+        role="user",
+        content=req.query,
+    )
 
     async def generate() -> AsyncGenerator[str, None]:
         import time
@@ -271,7 +340,6 @@ async def chat(req: ChatRequest):
         }
 
         try:
-            # Each node returns a PARTIAL dict — merge back into full state
             def apply(s: ARWAState, update: dict) -> ARWAState:
                 return {**s, **update}  # type: ignore[return-value]
 
@@ -281,7 +349,7 @@ async def chat(req: ChatRequest):
             if plan_step:
                 yield _sse({"type": "trace", "step": _trace_dc_to_dict(plan_step)})
 
-            # ── RETRIEVE (with one retry if low confidence) ─────────────────
+            # ── RETRIEVE ────────────────────────────────────────────────────
             for _attempt in range(2):
                 state = apply(state, await asyncio.to_thread(run_retriever, state))
                 ret_step = state["trace"][-1] if state["trace"] else None
@@ -290,7 +358,7 @@ async def chat(req: ChatRequest):
                 if state.get("retrieval_confidence", 0.0) >= 0.4:
                     break
 
-            # ── REASON (streaming via AsyncAnthropic) ───────────────────────
+            # ── REASON (streaming) ───────────────────────────────────────────
             chunks = state.get("retrieved_chunks", [])
             context_parts: list[str] = []
             for i, ch in enumerate(chunks[:8]):
@@ -305,10 +373,7 @@ async def chat(req: ChatRequest):
                 "Be concise and accurate. "
                 "If the context does not contain the answer, say so honestly."
             )
-            user_msg = (
-                f"Context:\n{context_block}\n\n"
-                f"Question: {req.query}"
-            )
+            user_msg_content = f"Context:\n{context_block}\n\nQuestion: {req.query}"
 
             t_reason = time.monotonic()
             full_answer = ""
@@ -317,7 +382,7 @@ async def chat(req: ChatRequest):
                 model="claude-sonnet-4-6",
                 max_tokens=2048,
                 system=system_prompt,
-                messages=[{"role": "user", "content": user_msg}],
+                messages=[{"role": "user", "content": user_msg_content}],
             ) as stream:
                 async for delta in stream.text_stream:
                     full_answer += delta
@@ -337,7 +402,7 @@ async def chat(req: ChatRequest):
             })
             yield _sse({"type": "trace", "step": _trace_dc_to_dict(reason_step)})
 
-            # ── TOOL (stub — no tools fired in MVP) ─────────────────────────
+            # ── TOOL ────────────────────────────────────────────────────────
             state = apply(state, await asyncio.to_thread(run_tool_executor, state))
             tool_step = state["trace"][-1] if state["trace"] else None
             if tool_step:
@@ -349,7 +414,7 @@ async def chat(req: ChatRequest):
             if verify_step:
                 yield _sse({"type": "trace", "step": _trace_dc_to_dict(verify_step)})
 
-            # ── DONE ────────────────────────────────────────────────────────
+            # ── Serialise for DONE event ─────────────────────────────────────
             citations_raw = state.get("citations", [])
             citations_out = [
                 {
@@ -363,15 +428,32 @@ async def chat(req: ChatRequest):
                 for c in citations_raw
             ]
             trace_out = [_trace_dc_to_dict(s) for s in state.get("trace", [])]
+            final_confidence = float(state.get("retrieval_confidence", 0.0))
+            final_risk = state.get("hallucination_risk", "medium")
+            final_answer = state.get("answer", "")
+
+            # Persist assistant message
+            asst_msg_id = str(uuid.uuid4())
+            await db.save_message(
+                msg_id=asst_msg_id,
+                conversation_id=conversation_id,
+                document_ids=req.document_ids,
+                role="assistant",
+                content=final_answer,
+                citations=citations_out,
+                confidence=final_confidence,
+                hallucination_risk=final_risk,
+                trace=trace_out,
+            )
 
             yield _sse({
                 "type": "done",
-                "answer": state.get("answer", ""),
+                "answer": final_answer,
                 "citations": citations_out,
-                "confidence": float(state.get("retrieval_confidence", 0.0)),
-                "hallucination_risk": state.get("hallucination_risk", "medium"),
+                "confidence": final_confidence,
+                "hallucination_risk": final_risk,
                 "trace": trace_out,
-                "conversation_id": req.conversation_id or str(uuid.uuid4()),
+                "conversation_id": conversation_id,
             })
             yield "data: [DONE]\n\n"
 
@@ -382,14 +464,14 @@ async def chat(req: ChatRequest):
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-@app.get("/api/v1/chat/{conversation_id}")
-def get_conversation(conversation_id: str):
-    """Stub — in-memory conversations are not persisted yet."""
-    return {"conversation_id": conversation_id, "messages": []}
+@app.get("/api/v1/chat/{conversation_id}", response_model=ConversationResponse)
+async def get_conversation(conversation_id: str):
+    messages = await db.get_conversation_messages(conversation_id)
+    return ConversationResponse(
+        conversation_id=conversation_id,
+        messages=[StoredMessage(**m) for m in messages],
+    )

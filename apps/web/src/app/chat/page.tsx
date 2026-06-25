@@ -13,8 +13,8 @@ import ChatInput from '@/components/ChatInput'
 import SuggestedQuestion from '@/components/SuggestedQuestion'
 import AgentTraceStep from '@/components/AgentTraceStep'
 
-import { listDocuments, streamChat } from '@/lib/api'
-import type { DocumentMeta as ApiDocMeta } from '@/lib/api'
+import { listDocuments, streamChat, getConversation } from '@/lib/api'
+import type { DocumentMeta as ApiDocMeta, StoredMessage } from '@/lib/api'
 import type { DocumentMeta as RowDocMeta } from '@/components/DocumentRow'
 import type { Message } from '@/components/ChatMessage'
 import type { Citation } from '@/components/CitationCard'
@@ -64,14 +64,39 @@ function ChatPageInner() {
 
   useEffect(() => {
     listDocuments()
-      .then((list) => {
+      .then(async (list) => {
         setDocs(list)
+
+        let docId: string | null = null
         if (initialDocId && list.some((d) => d.document_id === initialDocId)) {
-          setActiveDocId(initialDocId)
-          setSelectedDocIds(new Set([initialDocId]))
+          docId = initialDocId
         } else if (!initialDocId && list.length > 0) {
-          setActiveDocId(list[0].document_id)
-          setSelectedDocIds(new Set([list[0].document_id]))
+          docId = list[0].document_id
+        }
+
+        if (docId) {
+          setActiveDocId(docId)
+          setSelectedDocIds(new Set([docId]))
+
+          // Restore previous conversation
+          try {
+            const history = await getConversation(docId)
+            if (history.length > 0) {
+              setMessages(
+                history.map((m: StoredMessage) => ({
+                  id: m.id,
+                  role: m.role,
+                  answer: m.content,
+                  citations: m.citations,
+                  confidence: m.confidence,
+                  hallucination_risk: m.hallucination_risk,
+                  isStreaming: false,
+                }))
+              )
+            }
+          } catch {
+            // No history yet — leave messages empty (empty state shown)
+          }
         }
       })
       .catch((err) => setDocsError(err instanceof Error ? err.message : 'Failed to load documents'))
@@ -121,7 +146,7 @@ function ChatPageInner() {
       ])
 
       try {
-        for await (const event of streamChat(text, Array.from(selectedDocIds))) {
+        for await (const event of streamChat(text, Array.from(selectedDocIds), activeDocId ?? undefined)) {
           if (event.type === 'text') {
             setMessages((prev) =>
               prev.map((m) =>

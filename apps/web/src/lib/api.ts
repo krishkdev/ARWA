@@ -81,6 +81,26 @@ export async function deleteDocument(docId: string): Promise<void> {
   await request(`/documents/${docId}`, { method: "DELETE" });
 }
 
+// ── Conversation history ──────────────────────────────────────────────────
+
+export interface StoredMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  citations: Citation[];
+  confidence: number;
+  hallucination_risk: "low" | "medium" | "high";
+  trace: AgentTraceStep[];
+  created_at: string;
+}
+
+export async function getConversation(conversationId: string): Promise<StoredMessage[]> {
+  const r = await request<{ conversation_id: string; messages: StoredMessage[] }>(
+    `/chat/${conversationId}`
+  );
+  return r.messages;
+}
+
 // ── Streaming types ───────────────────────────────────────────────────────
 
 export type StreamEvent =
