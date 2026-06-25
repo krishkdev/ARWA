@@ -54,17 +54,16 @@ body {
   background: #C8C3BB;
 }
 
-/* Streaming cursor */
-@keyframes cursor-blink {
-  0%, 100% { opacity: 1; }
-  50%       { opacity: 0; }
+/* Thinking ripple — three dots, staggered */
+@keyframes thinking-pulse {
+  0%, 60%, 100% { opacity: 0.2; transform: scale(0.8); }
+  30%           { opacity: 1;   transform: scale(1.2); }
 }
-.streaming-cursor {
+.thinking-dot {
   display: inline-block;
-  width: 2px;
-  height: 1em;
-  background-color: #1A1814;
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  animation: cursor-blink 0.9s step-end infinite;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #1A8A6B;
+  animation: thinking-pulse 1.2s ease-in-out infinite;
 }

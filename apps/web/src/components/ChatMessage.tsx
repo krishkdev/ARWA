@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import { Pin, Copy, ThumbsUp, ThumbsDown } from 'lucide-react'
 import ConfidenceBar from './ConfidenceBar'
 import CitationChip from './CitationChip'
+import ThinkingIndicator from './ThinkingIndicator'
 import type { Citation } from './CitationCard'
 
 export interface Message {
@@ -68,28 +69,27 @@ export default function ChatMessage({ message, onCitationClick }: ChatMessagePro
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       {/* Markdown prose */}
       <div style={{ fontSize: 15, color: '#1A1814', fontFamily: 'inherit' }}>
-        {message.answer === '' && message.isStreaming ? (
-          <span className="streaming-cursor" aria-hidden />
+        {message.isStreaming && message.answer === '' ? (
+          // Waiting for first token — show ripple
+          <ThinkingIndicator />
         ) : (
-          <>
-            <ReactMarkdown
-              components={{
-                h1: ({ children }) => <h1 style={md.h1}>{children}</h1>,
-                h2: ({ children }) => <h2 style={md.h2}>{children}</h2>,
-                h3: ({ children }) => <h3 style={md.h3}>{children}</h3>,
-                p:  ({ children }) => <p  style={md.p}>{children}</p>,
-                ul: ({ children }) => <ul style={md.ul}>{children}</ul>,
-                ol: ({ children }) => <ol style={md.ol}>{children}</ol>,
-                li: ({ children }) => <li style={md.li}>{children}</li>,
-                strong: ({ children }) => (
-                  <strong style={{ fontWeight: 600, color: '#1A1814' }}>{children}</strong>
-                ),
-              }}
-            >
-              {message.answer}
-            </ReactMarkdown>
-            {message.isStreaming && <span className="streaming-cursor" aria-hidden />}
-          </>
+          // Streaming text or completed response
+          <ReactMarkdown
+            components={{
+              h1:     ({ children }) => <h1 style={md.h1}>{children}</h1>,
+              h2:     ({ children }) => <h2 style={md.h2}>{children}</h2>,
+              h3:     ({ children }) => <h3 style={md.h3}>{children}</h3>,
+              p:      ({ children }) => <p  style={md.p}>{children}</p>,
+              ul:     ({ children }) => <ul style={md.ul}>{children}</ul>,
+              ol:     ({ children }) => <ol style={md.ol}>{children}</ol>,
+              li:     ({ children }) => <li style={md.li}>{children}</li>,
+              strong: ({ children }) => (
+                <strong style={{ fontWeight: 600, color: '#1A1814' }}>{children}</strong>
+              ),
+            }}
+          >
+            {message.answer}
+          </ReactMarkdown>
         )}
       </div>
 
